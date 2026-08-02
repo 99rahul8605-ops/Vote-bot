@@ -159,6 +159,12 @@ async def set_results_message(giveaway_id: str, message_id: int):
     )
 
 
+async def set_invite_link(giveaway_id: str, invite_link: str):
+    await giveaways_col.update_one(
+        {"_id": ObjectId(giveaway_id)}, {"$set": {"invite_link": invite_link}}
+    )
+
+
 async def get_active_giveaways_by_creator(user_id: int):
     cursor = giveaways_col.find({"creator_id": user_id, "status": "active"}).sort("created_at", -1)
     return await cursor.to_list(length=100)
@@ -321,7 +327,7 @@ def back_to_menu_kb():
 
 def connect_menu_kb(bot_username: str):
     kb = InlineKeyboardBuilder()
-    admin_rights = "post_messages+edit_messages+delete_messages+pin_messages"
+    admin_rights = "post_messages+edit_messages+delete_messages+pin_messages+invite_users"
     kb.button(
         text="📢 Add to Channel",
         url=f"https://t.me/{bot_username}?startchannel&admin={admin_rights}",
@@ -667,6 +673,15 @@ async def receive_channel(message: Message, state: FSMContext):
     gid = await create_giveaway(chat.id, chat.title or str(chat.id), chat.username, message.from_user.id)
     bot_me = await bot.get_me()
 
+    # Private channels have no public @username — auto-generate a real invite link
+    # so participants (and DM messages) always have a working way to open the channel.
+    if not chat.username:
+        try:
+            invite = await bot.create_chat_invite_link(chat.id, name="Vote Bot Giveaway")
+            await set_invite_link(gid, invite.invite_link)
+        except Exception:
+            pass  # bot may lack "invite users" rights — falls back to post-link elsewhere
+
     announce_text = (
         "🎉 <b>Vote Giveaway Started!</b>\n\n"
         "Tap the button below to join and get your votes started.\n"
@@ -733,8 +748,27 @@ async def confirm_participate(call: CallbackQuery):
     )
     await add_participant(gid, user.id, user.first_name or "User", user.username, sent.message_id)
 
+    post_link = build_message_link(gw["channel_id"], gw.get("channel_username"), sent.message_id)
+    if gw.get("channel_username"):
+        channel_link = f"https://t.me/{gw['channel_username']}"
+    elif gw.get("invite_link"):
+        channel_link = gw["invite_link"]
+    else:
+        channel_link = post_link  # last-resort fallback if no invite link could be generated
+
+    success_kb = InlineKeyboardBuilder()
+    success_kb.button(text="📢 Open Channel", url=channel_link, style="primary")
+    success_kb.button(text="📌 My Post", url=post_link, style="success")
+    success_kb.adjust(1)
+
     await call.message.edit_text(
-        "🎊 You're in! Your profile has been posted in the channel.\nAsk your friends to vote for you! 🗳"
+        "🎊 You're in! Your profile has been posted in the channel.\n"
+        "Ask your friends to vote for you! 🗳\n\n"
+        f"📢 Channel: {channel_link}\n"
+        f"📌 Your post: {post_link}\n\n"
+        "📊 Check your live score anytime by sending /score to me.",
+        reply_markup=success_kb.as_markup(),
+        disable_web_page_preview=True,
     )
     await call.answer()
 
