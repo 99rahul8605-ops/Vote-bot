@@ -741,10 +741,6 @@ async def vote_callback(call: CallbackQuery):
         await call.answer("⛔ This giveaway has ended.", show_alert=True)
         return
 
-    if call.from_user.id == participant_id:
-        await call.answer("🚫 You can't vote for yourself!", show_alert=True)
-        return
-
     try:
         member = await bot.get_chat_member(gw["channel_id"], call.from_user.id)
         is_member = member.status in ("member", "administrator", "creator")
