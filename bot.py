@@ -152,6 +152,12 @@ async def set_announce_message(giveaway_id: str, message_id: int):
     )
 
 
+async def set_results_message(giveaway_id: str, message_id: int):
+    await giveaways_col.update_one(
+        {"_id": ObjectId(giveaway_id)}, {"$set": {"results_message_id": message_id}}
+    )
+
+
 async def get_active_giveaways_by_creator(user_id: int):
     cursor = giveaways_col.find({"creator_id": user_id, "status": "active"}).sort("created_at", -1)
     return await cursor.to_list(length=100)
@@ -223,6 +229,11 @@ async def get_leaderboard(giveaway_id: str, limit: int = 10):
     return await cursor.to_list(length=limit)
 
 
+async def get_all_participants(giveaway_id: str):
+    cursor = participants_col.find({"giveaway_id": giveaway_id})
+    return await cursor.to_list(length=None)
+
+
 async def get_participant_total():
     return await participants_col.count_documents({})
 
@@ -287,9 +298,9 @@ class IsOwner(Filter):
 
 def main_menu_kb():
     kb = InlineKeyboardBuilder()
-    kb.button(text="🔗 Connect", callback_data="menu:connect")
-    kb.button(text="🎉 Create Giveaway", callback_data="menu:create_giveaway")
-    kb.button(text="⚙️ Manage", callback_data="menu:manage")
+    kb.button(text="🔗 Connect", callback_data="menu:connect", style="primary")
+    kb.button(text="🎉 Create Giveaway", callback_data="menu:create_giveaway", style="success")
+    kb.button(text="⚙️ Manage", callback_data="menu:manage", style="primary")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -303,10 +314,15 @@ def back_to_menu_kb():
 def connect_menu_kb(bot_username: str):
     kb = InlineKeyboardBuilder()
     admin_rights = "post_messages+edit_messages+delete_messages+pin_messages"
-    kb.button(text="📢 Add to Channel", url=f"https://t.me/{bot_username}?startchannel&admin={admin_rights}")
+    kb.button(
+        text="📢 Add to Channel",
+        url=f"https://t.me/{bot_username}?startchannel&admin={admin_rights}",
+        style="primary",
+    )
     kb.button(
         text="👥 Add to Group",
         url=f"https://t.me/{bot_username}?startgroup&admin=delete_messages+pin_messages+promote_members",
+        style="primary",
     )
     kb.button(text="📃 View Connected Chats", callback_data="connect:list")
     kb.button(text="⬅️ Back", callback_data="menu:main")
@@ -327,7 +343,7 @@ def connect_list_kb(chats):
 
 def manage_menu_kb():
     kb = InlineKeyboardBuilder()
-    kb.button(text="📃 My Giveaways", callback_data="manage:list")
+    kb.button(text="📃 My Giveaways", callback_data="manage:list", style="primary")
     kb.button(text="⬅️ Back", callback_data="menu:main")
     kb.adjust(1)
     return kb.as_markup()
@@ -347,10 +363,14 @@ def manage_giveaway_list_kb(giveaways):
 def manage_giveaway_actions_kb(gid: str, multi_vote: bool, active: bool):
     kb = InlineKeyboardBuilder()
     if active:
-        kb.button(text="➕ Add Vote", callback_data=f"manage:addvote:{gid}")
-        kb.button(text="➖ Remove Vote", callback_data=f"manage:removevote:{gid}")
-        kb.button(text=f"🔁 Multi-Vote: {'ON' if multi_vote else 'OFF'}", callback_data=f"manage:multitoggle:{gid}")
-        kb.button(text="🏁 End Giveaway", callback_data=f"manage:end:{gid}")
+        kb.button(text="➕ Add Vote", callback_data=f"manage:addvote:{gid}", style="success")
+        kb.button(text="➖ Remove Vote", callback_data=f"manage:removevote:{gid}", style="danger")
+        kb.button(
+            text=f"🔁 Multi-Vote: {'ON' if multi_vote else 'OFF'}",
+            callback_data=f"manage:multitoggle:{gid}",
+            style="primary",
+        )
+        kb.button(text="🏁 End Giveaway", callback_data=f"manage:end:{gid}", style="danger")
     kb.button(text="⬅️ Back", callback_data="manage:list")
     kb.adjust(1)
     return kb.as_markup()
@@ -358,32 +378,32 @@ def manage_giveaway_actions_kb(gid: str, multi_vote: bool, active: bool):
 
 def participate_confirm_kb(gid: str):
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Yes, Participate", callback_data=f"confirm:{gid}:yes")
-    kb.button(text="❌ No", callback_data=f"confirm:{gid}:no")
+    kb.button(text="✅ Yes, Participate", callback_data=f"confirm:{gid}:yes", style="success")
+    kb.button(text="❌ No", callback_data=f"confirm:{gid}:no", style="danger")
     kb.adjust(2)
     return kb.as_markup()
 
 
 def profile_post_kb(gid: str, user_id: int, bot_username: str, votes: int):
     kb = InlineKeyboardBuilder()
-    kb.button(text=f"🗳 Vote ({votes})", callback_data=f"vote:{gid}:{user_id}")
-    kb.button(text="🎉 Participate", url=f"https://t.me/{bot_username}?start=join_{gid}")
+    kb.button(text=f"🗳 Vote ({votes})", callback_data=f"vote:{gid}:{user_id}", style="primary")
+    kb.button(text="🎉 Participate", url=f"https://t.me/{bot_username}?start=join_{gid}", style="success")
     kb.adjust(1)
     return kb.as_markup()
 
 
 def announce_kb(gid: str, bot_username: str):
     kb = InlineKeyboardBuilder()
-    kb.button(text="🎉 Participate", url=f"https://t.me/{bot_username}?start=join_{gid}")
+    kb.button(text="🎉 Participate", url=f"https://t.me/{bot_username}?start=join_{gid}", style="success")
     kb.adjust(1)
     return kb.as_markup()
 
 
 def scoreboard_kb(gid: str, my_post_link: str = None):
     kb = InlineKeyboardBuilder()
-    kb.button(text="🔄 Refresh", callback_data=f"score:refresh:{gid}")
+    kb.button(text="🔄 Refresh", callback_data=f"score:refresh:{gid}", style="primary")
     if my_post_link:
-        kb.button(text="📌 See My Post", url=my_post_link)
+        kb.button(text="📌 See My Post", url=my_post_link, style="success")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -817,6 +837,7 @@ async def end_giveaway_cb(call: CallbackQuery):
         return
 
     leaderboard = await get_leaderboard(gid, 10)
+    all_participants = await get_all_participants(gid)
     await end_giveaway(gid)
 
     lines = ["🏁 <b>Giveaway Ended!</b>", "", f"🏆 <b>Top {len(leaderboard)} Winners</b>", ""]
@@ -829,15 +850,34 @@ async def end_giveaway_cb(call: CallbackQuery):
     lines.append("🎉 Congratulations to all winners! Thank you for participating.")
     text = "\n".join(lines)
 
+    results_message_id = None
     try:
-        await bot.send_message(gw["channel_id"], text)
+        sent = await bot.send_message(gw["channel_id"], text)
+        results_message_id = sent.message_id
+        await set_results_message(gid, results_message_id)
         if gw.get("announce_message_id"):
             await bot.unpin_chat_message(gw["channel_id"], gw["announce_message_id"])
     except Exception:
         pass
 
+    # Notify every participant in DM with the final scoreboard
+    dm_text = text
+    if results_message_id:
+        link = build_message_link(gw["channel_id"], gw.get("channel_username"), results_message_id)
+        dm_text += f'\n\n🔗 <a href="{link}">View in channel</a>'
+
+    notified = 0
+    for p in all_participants:
+        try:
+            await bot.send_message(p["user_id"], dm_text, disable_web_page_preview=True)
+            notified += 1
+        except Exception:
+            pass
+        await asyncio.sleep(0.05)  # throttle to stay under Telegram flood limits
+
     await call.message.edit_text(
-        "✅ Giveaway ended. Scoreboard posted in the channel.", reply_markup=back_to_menu_kb()
+        f"✅ Giveaway ended. Scoreboard posted in the channel.\n📩 Notified {notified}/{len(all_participants)} participants.",
+        reply_markup=back_to_menu_kb(),
     )
     await call.answer()
 
@@ -923,13 +963,15 @@ async def receive_amount(message: Message, state: FSMContext):
 
 async def resolve_score_gid(user_id: int):
     """Pick the giveaway to show: (a) an active one this user created, else
-    (b) a giveaway they're participating in."""
+    (b) the most recent giveaway they're participating in (active or ended)."""
     giveaways = await get_active_giveaways_by_creator(user_id)
     if giveaways:
         return str(giveaways[0]["_id"]), giveaways[0]["channel_title"]
 
-    participant = await participants_col.find_one({"user_id": user_id})
-    if participant:
+    cursor = participants_col.find({"user_id": user_id}).sort("joined_at", -1)
+    results = await cursor.to_list(length=1)
+    if results:
+        participant = results[0]
         gid = participant["giveaway_id"]
         gw = await get_giveaway(gid)
         return gid, (gw["channel_title"] if gw else None)
@@ -959,9 +1001,23 @@ async def build_scoreboard_text(gid: str, channel_title, gw):
 
 async def send_scoreboard(target, gid: str, channel_title, user_id: int, edit: bool):
     gw = await get_giveaway(gid)
+
     if not gw:
         text_out = "This giveaway no longer exists."
         kb = None
+
+    elif gw["status"] != "active":
+        # Ended: show a clear "ended" notice, no refresh (nothing will change anymore)
+        board_text, _ = await build_scoreboard_text(gid, channel_title, gw)
+        text_out = "🔴 <b>This giveaway has ended.</b>\n\n" + board_text
+
+        kb_builder = InlineKeyboardBuilder()
+        if gw.get("results_message_id"):
+            results_link = build_message_link(gw["channel_id"], gw.get("channel_username"), gw["results_message_id"])
+            kb_builder.button(text="🏆 View Final Results", url=results_link)
+        kb_builder.adjust(1)
+        kb = kb_builder.as_markup()
+
     else:
         text_out, _ = await build_scoreboard_text(gid, channel_title, gw)
         my_post_link = None
@@ -992,7 +1048,10 @@ async def score_cmd(message: Message):
 async def score_refresh(call: CallbackQuery):
     gid = call.data.split(":")[2]
     gw = await get_giveaway(gid)
-    channel_title = gw["channel_title"] if gw else None
+    if not gw or gw["status"] != "active":
+        await call.answer("This giveaway has ended.", show_alert=True)
+        return
+    channel_title = gw["channel_title"]
     await send_scoreboard(call, gid, channel_title, call.from_user.id, edit=True)
     await call.answer("Refreshed ✅")
 
