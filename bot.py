@@ -21,6 +21,7 @@ from datetime import datetime
 from bson import ObjectId
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.errors import DuplicateKeyError
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -255,15 +256,22 @@ async def has_voted(giveaway_id: str, voter_id: int, participant_id: int, multi_
     return existing is not None
 
 
-async def record_vote(giveaway_id: str, voter_id: int, participant_id: int):
-    await votes_col.insert_one(
-        {
-            "giveaway_id": giveaway_id,
-            "voter_id": voter_id,
-            "participant_id": participant_id,
-            "created_at": datetime.utcnow(),
-        }
-    )
+async def record_vote(giveaway_id: str, voter_id: int, participant_id: int) -> bool:
+    """Atomically records a vote. Returns False if this exact (giveaway, voter,
+    participant) combo already exists — guarded by a unique DB index, so this
+    catches double-taps / replayed requests that slip past the earlier check."""
+    try:
+        await votes_col.insert_one(
+            {
+                "giveaway_id": giveaway_id,
+                "voter_id": voter_id,
+                "participant_id": participant_id,
+                "created_at": datetime.utcnow(),
+            }
+        )
+        return True
+    except DuplicateKeyError:
+        return False
 
 
 async def get_vote_total():
@@ -761,7 +769,12 @@ async def vote_callback(call: CallbackQuery):
         await call.answer("Participant not found.", show_alert=True)
         return
 
-    await record_vote(gid, call.from_user.id, participant_id)
+    success = await record_vote(gid, call.from_user.id, participant_id)
+    if not success:
+        # DB-level unique index caught a race/replay — vote was already recorded
+        await call.answer("✅ You have already voted!", show_alert=True)
+        return
+
     participant = await update_votes(gid, participant_id, +1)
 
     await refresh_profile_message(gw, participant)
@@ -812,6 +825,10 @@ async def render_giveaway_panel(call: CallbackQuery, gid: str):
 @dp.callback_query(F.data.startswith("manage:g:"))
 async def giveaway_actions(call: CallbackQuery):
     gid = call.data.split(":")[2]
+    gw = await get_giveaway(gid)
+    if not gw or gw["creator_id"] != call.from_user.id:
+        await call.answer("⛔ You don't have permission to manage this giveaway.", show_alert=True)
+        return
     await render_giveaway_panel(call, gid)
     await call.answer()
 
@@ -819,6 +836,10 @@ async def giveaway_actions(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("manage:multitoggle:"))
 async def multi_toggle(call: CallbackQuery):
     gid = call.data.split(":")[2]
+    gw = await get_giveaway(gid)
+    if not gw or gw["creator_id"] != call.from_user.id:
+        await call.answer("⛔ You don't have permission to manage this giveaway.", show_alert=True)
+        return
     new_val = await toggle_multi_vote(gid)
     await render_giveaway_panel(call, gid)
     await call.answer(f"Multi-vote turned {'ON' if new_val else 'OFF'}")
@@ -828,7 +849,10 @@ async def multi_toggle(call: CallbackQuery):
 async def end_giveaway_cb(call: CallbackQuery):
     gid = call.data.split(":")[2]
     gw = await get_giveaway(gid)
-    if not gw or gw["status"] != "active":
+    if not gw or gw["creator_id"] != call.from_user.id:
+        await call.answer("⛔ You don't have permission to manage this giveaway.", show_alert=True)
+        return
+    if gw["status"] != "active":
         await call.answer("Already ended.", show_alert=True)
         return
 
@@ -881,6 +905,10 @@ async def end_giveaway_cb(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("manage:addvote:"))
 async def ask_addvote(call: CallbackQuery, state: FSMContext):
     gid = call.data.split(":")[2]
+    gw = await get_giveaway(gid)
+    if not gw or gw["creator_id"] != call.from_user.id:
+        await call.answer("⛔ You don't have permission to manage this giveaway.", show_alert=True)
+        return
     await state.update_data(gid=gid, action="add")
     await state.set_state(ManageVote.waiting_participant_id)
     await call.message.edit_text(
@@ -892,6 +920,10 @@ async def ask_addvote(call: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data.startswith("manage:removevote:"))
 async def ask_removevote(call: CallbackQuery, state: FSMContext):
     gid = call.data.split(":")[2]
+    gw = await get_giveaway(gid)
+    if not gw or gw["creator_id"] != call.from_user.id:
+        await call.answer("⛔ You don't have permission to manage this giveaway.", show_alert=True)
+        return
     await state.update_data(gid=gid, action="remove")
     await state.set_state(ManageVote.waiting_participant_id)
     await call.message.edit_text(
@@ -1134,6 +1166,11 @@ async def id_cmd(message: Message):
 # ============================================================
 
 async def main():
+    # Enforces one vote per (giveaway, voter, participant) at the database level,
+    # so a double-tap or a scripted replay can never slip through as two votes.
+    await votes_col.create_index(
+        [("giveaway_id", 1), ("voter_id", 1), ("participant_id", 1)], unique=True
+    )
     await bot.delete_webhook(drop_pending_updates=True)
     log.info("Vote Bot started. Polling...")
     await dp.start_polling(bot)
