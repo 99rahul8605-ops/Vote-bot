@@ -16,13 +16,30 @@ def back_to_menu_kb():
     return kb.as_markup()
 
 
+def connect_menu_kb(bot_username: str):
+    kb = InlineKeyboardBuilder()
+    admin_rights = "post_messages+edit_messages+delete_messages+pin_messages"
+    kb.button(
+        text="📢 Add to Channel",
+        url=f"https://t.me/{bot_username}?startchannel&admin={admin_rights}",
+    )
+    kb.button(
+        text="👥 Add to Group",
+        url=f"https://t.me/{bot_username}?startgroup&admin=delete_messages+pin_messages+promote_members",
+    )
+    kb.button(text="📃 View Connected Chats", callback_data="connect:list")
+    kb.button(text="⬅️ Back", callback_data="menu:main")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 def connect_list_kb(chats):
     kb = InlineKeyboardBuilder()
     for c in chats:
         label = c.get("title") or str(c["chat_id"])
         icon = "📢" if c["type"] == "channel" else "👥"
         kb.button(text=f"{icon} {label}", callback_data=f"connect:info:{c['chat_id']}")
-    kb.button(text="⬅️ Back", callback_data="menu:main")
+    kb.button(text="⬅️ Back", callback_data="menu:connect")
     kb.adjust(1)
     return kb.as_markup()
 
