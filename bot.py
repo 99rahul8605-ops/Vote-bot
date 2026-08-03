@@ -43,6 +43,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DB_NAME = os.getenv("DB_NAME", "vote_bot")
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or "0")
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0") or "0")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN not set. Please add it to your .env file.")
@@ -443,6 +444,19 @@ dp = Dispatcher(storage=MemoryStorage())
 
 START_TIME = time.time()
 
+
+async def log_event(text: str):
+    """Posts an audit entry to the configured log channel. Silently does
+    nothing if LOG_CHANNEL_ID isn't set or the bot lacks access there —
+    logging failures should never break the bot's actual functionality."""
+    if not LOG_CHANNEL_ID:
+        return
+    try:
+        await bot.send_message(LOG_CHANNEL_ID, text, disable_web_page_preview=True)
+    except Exception:
+        pass
+
+
 WELCOME_TEXT = (
     "👋 <b>Welcome to Vote Bot!</b>\n\n"
     "I help you run <b>vote-based giveaways</b> in your channels and groups.\n\n"
@@ -694,6 +708,13 @@ async def receive_channel(message: Message, state: FSMContext):
         pass
     await set_announce_message(gid, sent.message_id)
 
+    await log_event(
+        "🎉 <b>Giveaway Created</b>\n"
+        f"Channel: {chat.title} (<code>{chat.id}</code>)\n"
+        f"Creator: {message.from_user.first_name} [<code>{message.from_user.id}</code>]\n"
+        f"Giveaway ID: <code>{gid}</code>"
+    )
+
     link = f"https://t.me/{bot_me.username}?start=join_{gid}"
 
     await message.answer(
@@ -747,6 +768,12 @@ async def confirm_participate(call: CallbackQuery):
         gw["channel_id"], profile_text, reply_markup=profile_post_kb(gid, user.id, bot_me.username, votes=0)
     )
     await add_participant(gid, user.id, user.first_name or "User", user.username, sent.message_id)
+
+    await log_event(
+        "🙋 <b>New Participant</b>\n"
+        f"Giveaway: {gw['channel_title']}\n"
+        f"User: {user.first_name or 'User'} (@{user.username or '—'}) [<code>{user.id}</code>]"
+    )
 
     post_link = build_message_link(gw["channel_id"], gw.get("channel_username"), sent.message_id)
     if gw.get("channel_username"):
@@ -810,6 +837,15 @@ async def vote_callback(call: CallbackQuery):
         return
 
     participant = await update_votes(gid, participant_id, +1)
+
+    voter = call.from_user
+    await log_event(
+        "🗳 <b>Vote Cast</b>\n"
+        f"Giveaway: {gw['channel_title']}\n"
+        f"Voter: {voter.first_name} (@{voter.username or '—'}) [<code>{voter.id}</code>]\n"
+        f"Voted for: {participant['first_name']} (@{participant.get('username') or '—'}) [<code>{participant['user_id']}</code>]\n"
+        f"New total: <b>{participant['votes']}</b>"
+    )
 
     await refresh_profile_message(gw, participant)
     await call.answer("🗳 Vote counted! Thank you.")
@@ -929,6 +965,14 @@ async def end_giveaway_cb(call: CallbackQuery):
             pass
         await asyncio.sleep(0.05)  # throttle to stay under Telegram flood limits
 
+    await log_event(
+        "🏁 <b>Giveaway Ended</b>\n"
+        f"Channel: {gw['channel_title']}\n"
+        f"Ended by: {call.from_user.first_name} [<code>{call.from_user.id}</code>]\n"
+        f"Total participants: {len(all_participants)}\n\n"
+        + text
+    )
+
     await call.message.edit_text(
         f"✅ Giveaway ended. Scoreboard posted in the channel.\n📩 Notified {notified}/{len(all_participants)} participants.",
         reply_markup=back_to_menu_kb(),
@@ -1014,6 +1058,15 @@ async def receive_amount(message: Message, state: FSMContext):
     gw = await get_giveaway(gid)
     participant = await update_votes(gid, participant_id, delta, log_line)
     await refresh_profile_message(gw, participant)
+
+    await log_event(
+        "🔧 <b>Manual Vote Adjustment</b>\n"
+        f"Giveaway: {gw['channel_title']}\n"
+        f"Admin: {message.from_user.first_name} [<code>{message.from_user.id}</code>]\n"
+        f"Participant: {participant['first_name']} [<code>{participant['user_id']}</code>]\n"
+        f"{'➕ Added' if action == 'add' else '➖ Removed'}: {amount} vote(s)\n"
+        f"New total: <b>{participant['votes']}</b>"
+    )
 
     await message.answer(f"✅ Done. {participant['first_name']} now has <b>{participant['votes']}</b> votes.")
     await state.clear()
