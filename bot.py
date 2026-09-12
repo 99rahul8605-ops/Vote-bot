@@ -15,8 +15,10 @@ Requires a .env file with:
 import asyncio
 import logging
 import os
+import re
 import time
 from datetime import datetime
+from html import escape
 
 from bson import ObjectId
 from dotenv import load_dotenv
@@ -62,6 +64,7 @@ chats_col = db["chats"]
 giveaways_col = db["giveaways"]
 participants_col = db["participants"]
 votes_col = db["votes"]
+vote_locks_col = db["vote_locks"]
 users_col = db["users"]
 
 
@@ -98,10 +101,9 @@ async def upsert_chat(chat_id: int, title: str, type_: str, username, added_by: 
                 "title": title,
                 "type": type_,
                 "username": username,
-                "added_by": added_by,
                 "updated_at": datetime.utcnow(),
             },
-            "$setOnInsert": {"added_at": datetime.utcnow()},
+            "$setOnInsert": {"added_at": datetime.utcnow(), "added_by": added_by},
         },
         upsert=True,
     )
@@ -263,10 +265,33 @@ async def has_voted(giveaway_id: str, voter_id: int, participant_id: int, multi_
     return existing is not None
 
 
-async def record_vote(giveaway_id: str, voter_id: int, participant_id: int) -> bool:
-    """Atomically records a vote. Returns False if this exact (giveaway, voter,
-    participant) combo already exists — guarded by a unique DB index, so this
-    catches double-taps / replayed requests that slip past the earlier check."""
+async def record_vote(giveaway_id: str, voter_id: int, participant_id: int, multi_vote: bool) -> bool:
+    """Atomically records a vote.
+
+    - Multi-vote ON: unique (giveaway, voter, participant) prevents duplicate
+      votes for the same participant.
+    - Multi-vote OFF: an additional unique (giveaway, voter) lock prevents two
+      simultaneous callbacks from voting for different participants.
+    """
+    lock_acquired = False
+
+    if not multi_vote:
+        # Fast path for voters who already voted before the lock existed
+        # (for example if multi-vote was ON and was later turned OFF).
+        if await votes_col.find_one({"giveaway_id": giveaway_id, "voter_id": voter_id}, {"_id": 1}):
+            return False
+        try:
+            await vote_locks_col.insert_one(
+                {
+                    "giveaway_id": giveaway_id,
+                    "voter_id": voter_id,
+                    "created_at": datetime.utcnow(),
+                }
+            )
+            lock_acquired = True
+        except DuplicateKeyError:
+            return False
+
     try:
         await votes_col.insert_one(
             {
@@ -278,7 +303,13 @@ async def record_vote(giveaway_id: str, voter_id: int, participant_id: int) -> b
         )
         return True
     except DuplicateKeyError:
+        if lock_acquired:
+            await vote_locks_col.delete_one({"giveaway_id": giveaway_id, "voter_id": voter_id})
         return False
+    except Exception:
+        if lock_acquired:
+            await vote_locks_col.delete_one({"giveaway_id": giveaway_id, "voter_id": voter_id})
+        raise
 
 
 async def get_vote_total():
@@ -445,6 +476,11 @@ dp = Dispatcher(storage=MemoryStorage())
 START_TIME = time.time()
 
 
+def h(value) -> str:
+    """Escape untrusted text before inserting it into ParseMode.HTML messages."""
+    return escape(str(value or ""), quote=False)
+
+
 async def log_event(text: str):
     """Posts an audit entry to the configured log channel. Silently does
     nothing if LOG_CHANNEL_ID isn't set or the bot lacks access there —
@@ -473,17 +509,17 @@ def build_profile_text(user_id, first_name, username, votes, logs=None):
     lines = [
         "🙋 <b>Giveaway Participant</b>",
         "",
-        f"👤 Name: {first_name}",
+        f"👤 Name: {h(first_name)}",
         f"🆔 ID: <code>{user_id}</code>",
     ]
     if username:
-        lines.append(f"🔗 Username: @{username}")
+        lines.append(f"🔗 Username: @{h(username)}")
     lines.append(f"🗳 Votes: <b>{votes}</b>")
     if logs:
         lines.append("")
         lines.append("📜 <b>Log:</b>")
         for l in logs[-5:]:
-            lines.append(f"• {l['text']}")
+            lines.append(f"• {h(l['text'])}")
     return "\n".join(lines)
 
 
@@ -527,7 +563,7 @@ async def handle_join_payload(message: Message, gid: str):
 
     await message.answer(
         f"🎉 You've been invited to join the vote giveaway in "
-        f"<b>{gw['channel_title']}</b>!\n\nDo you want to participate?",
+        f"<b>{h(gw['channel_title'])}</b>!\n\nDo you want to participate?",
         reply_markup=participate_confirm_kb(gid),
     )
 
@@ -619,13 +655,13 @@ async def show_connected_list(call: CallbackQuery):
 async def chat_info(call: CallbackQuery):
     chat_id = int(call.data.split(":")[2])
     chat = await get_chat(chat_id)
-    if not chat:
-        await call.answer("Not found.", show_alert=True)
+    if not chat or chat.get("added_by") != call.from_user.id:
+        await call.answer("⛔ Not authorized.", show_alert=True)
         return
 
-    lines = [f"{chat['title']}", f"Type: {chat['type']}", f"ID: {chat['chat_id']}"]
+    lines = [f"{h(chat['title'])}", f"Type: {h(chat['type'])}", f"ID: {chat['chat_id']}"]
     if chat.get("username"):
-        lines.append(f"Username: @{chat['username']}")
+        lines.append(f"Username: @{h(chat['username'])}")
 
     await call.answer("\n".join(lines), show_alert=True)
 
@@ -684,6 +720,19 @@ async def receive_channel(message: Message, state: FSMContext):
         )
         return
 
+    # The user creating the giveaway must also be an admin/owner of the target chat.
+    # Otherwise any random user could make this bot post in a channel where the bot
+    # happens to be an admin.
+    try:
+        creator_member = await bot.get_chat_member(chat.id, message.from_user.id)
+    except Exception:
+        await message.answer("❌ I couldn't verify your admin status in that chat.")
+        return
+
+    if creator_member.status not in ("administrator", "creator"):
+        await message.answer("⛔ You must be an admin/owner of that channel or group to create a giveaway there.")
+        return
+
     gid = await create_giveaway(chat.id, chat.title or str(chat.id), chat.username, message.from_user.id)
     bot_me = await bot.get_me()
 
@@ -710,15 +759,15 @@ async def receive_channel(message: Message, state: FSMContext):
 
     await log_event(
         "🎉 <b>Giveaway Created</b>\n"
-        f"Channel: {chat.title} (<code>{chat.id}</code>)\n"
-        f"Creator: {message.from_user.first_name} [<code>{message.from_user.id}</code>]\n"
+        f"Channel: {h(chat.title)} (<code>{chat.id}</code>)\n"
+        f"Creator: {h(message.from_user.first_name)} [<code>{message.from_user.id}</code>]\n"
         f"Giveaway ID: <code>{gid}</code>"
     )
 
     link = f"https://t.me/{bot_me.username}?start=join_{gid}"
 
     await message.answer(
-        f"✅ Giveaway started in <b>{chat.title}</b>!\n\n"
+        f"✅ Giveaway started in <b>{h(chat.title)}</b>!\n\n"
         f"🔗 Participate link:\n{link}\n\n"
         f"It has been posted and pinned in the channel.",
         reply_markup=back_to_menu_kb(),
@@ -767,12 +816,23 @@ async def confirm_participate(call: CallbackQuery):
     sent = await bot.send_message(
         gw["channel_id"], profile_text, reply_markup=profile_post_kb(gid, user.id, bot_me.username, votes=0)
     )
-    await add_participant(gid, user.id, user.first_name or "User", user.username, sent.message_id)
+    try:
+        await add_participant(gid, user.id, user.first_name or "User", user.username, sent.message_id)
+    except DuplicateKeyError:
+        # A simultaneous confirmation already inserted this participant. Remove the
+        # duplicate channel post we just created and return the existing state.
+        try:
+            await bot.delete_message(gw["channel_id"], sent.message_id)
+        except Exception:
+            pass
+        await call.message.edit_text("✅ You're already participating in this giveaway!")
+        await call.answer()
+        return
 
     await log_event(
         "🙋 <b>New Participant</b>\n"
-        f"Giveaway: {gw['channel_title']}\n"
-        f"User: {user.first_name or 'User'} (@{user.username or '—'}) [<code>{user.id}</code>]"
+        f"Giveaway: {h(gw['channel_title'])}\n"
+        f"User: {h(user.first_name or 'User')} (@{h(user.username or '—')}) [<code>{user.id}</code>]"
     )
 
     post_link = build_message_link(gw["channel_id"], gw.get("channel_username"), sent.message_id)
@@ -830,7 +890,7 @@ async def vote_callback(call: CallbackQuery):
         await call.answer("Participant not found.", show_alert=True)
         return
 
-    success = await record_vote(gid, call.from_user.id, participant_id)
+    success = await record_vote(gid, call.from_user.id, participant_id, gw.get("multi_vote", False))
     if not success:
         # DB-level unique index caught a race/replay — vote was already recorded
         await call.answer("✅ You have already voted!", show_alert=True)
@@ -841,9 +901,9 @@ async def vote_callback(call: CallbackQuery):
     voter = call.from_user
     await log_event(
         "🗳 <b>Vote Cast</b>\n"
-        f"Giveaway: {gw['channel_title']}\n"
-        f"Voter: {voter.first_name} (@{voter.username or '—'}) [<code>{voter.id}</code>]\n"
-        f"Voted for: {participant['first_name']} (@{participant.get('username') or '—'}) [<code>{participant['user_id']}</code>]\n"
+        f"Giveaway: {h(gw['channel_title'])}\n"
+        f"Voter: {h(voter.first_name)} (@{h(voter.username or '—')}) [<code>{voter.id}</code>]\n"
+        f"Voted for: {h(participant['first_name'])} (@{h(participant.get('username') or '—')}) [<code>{participant['user_id']}</code>]\n"
         f"New total: <b>{participant['votes']}</b>"
     )
 
@@ -882,7 +942,7 @@ async def render_giveaway_panel(call: CallbackQuery, gid: str):
         return
     count = await get_participant_count(gid)
     text = (
-        f"🎉 <b>{gw['channel_title']}</b>\n"
+        f"🎉 <b>{h(gw['channel_title'])}</b>\n"
         f"Status: {'🟢 Active' if gw['status'] == 'active' else '🔴 Ended'}\n"
         f"Participants: {count}\n"
         f"Multi-Vote: {'ON' if gw.get('multi_vote') else 'OFF'}"
@@ -910,6 +970,9 @@ async def multi_toggle(call: CallbackQuery):
     if not gw or gw["creator_id"] != call.from_user.id:
         await call.answer("⛔ You don't have permission to manage this giveaway.", show_alert=True)
         return
+    if gw.get("status") != "active":
+        await call.answer("⛔ This giveaway has already ended.", show_alert=True)
+        return
     new_val = await toggle_multi_vote(gid)
     await render_giveaway_panel(call, gid)
     await call.answer(f"Multi-vote turned {'ON' if new_val else 'OFF'}")
@@ -934,7 +997,7 @@ async def end_giveaway_cb(call: CallbackQuery):
     medals = ["🥇", "🥈", "🥉"]
     for i, p in enumerate(leaderboard):
         medal = medals[i] if i < 3 else f"{i + 1}."
-        uname = f"@{p['username']}" if p.get("username") else p["first_name"]
+        uname = f"@{h(p['username'])}" if p.get("username") else h(p["first_name"])
         lines.append(f"{medal} {uname} — <b>{p['votes']}</b> votes")
     lines.append("")
     lines.append("🎉 Congratulations to all winners! Thank you for participating.")
@@ -967,8 +1030,8 @@ async def end_giveaway_cb(call: CallbackQuery):
 
     await log_event(
         "🏁 <b>Giveaway Ended</b>\n"
-        f"Channel: {gw['channel_title']}\n"
-        f"Ended by: {call.from_user.first_name} [<code>{call.from_user.id}</code>]\n"
+        f"Channel: {h(gw['channel_title'])}\n"
+        f"Ended by: {h(call.from_user.first_name)} [<code>{call.from_user.id}</code>]\n"
         f"Total participants: {len(all_participants)}\n\n"
         + text
     )
@@ -987,6 +1050,9 @@ async def ask_addvote(call: CallbackQuery, state: FSMContext):
     if not gw or gw["creator_id"] != call.from_user.id:
         await call.answer("⛔ You don't have permission to manage this giveaway.", show_alert=True)
         return
+    if gw.get("status") != "active":
+        await call.answer("⛔ This giveaway has already ended.", show_alert=True)
+        return
     await state.update_data(gid=gid, action="add")
     await state.set_state(ManageVote.waiting_participant_id)
     await call.message.edit_text(
@@ -1001,6 +1067,9 @@ async def ask_removevote(call: CallbackQuery, state: FSMContext):
     gw = await get_giveaway(gid)
     if not gw or gw["creator_id"] != call.from_user.id:
         await call.answer("⛔ You don't have permission to manage this giveaway.", show_alert=True)
+        return
+    if gw.get("status") != "active":
+        await call.answer("⛔ This giveaway has already ended.", show_alert=True)
         return
     await state.update_data(gid=gid, action="remove")
     await state.set_state(ManageVote.waiting_participant_id)
@@ -1027,7 +1096,7 @@ async def receive_participant(message: Message, state: FSMContext):
     if raw.isdigit():
         participant = await get_participant(gid, int(raw))
     else:
-        cursor = participants_col.find({"giveaway_id": gid, "username": {"$regex": f"^{raw}$", "$options": "i"}})
+        cursor = participants_col.find({"giveaway_id": gid, "username": {"$regex": f"^{re.escape(raw)}$", "$options": "i"}})
         results = await cursor.to_list(length=1)
         participant = results[0] if results else None
 
@@ -1042,33 +1111,74 @@ async def receive_participant(message: Message, state: FSMContext):
 
 @dp.message(ManageVote.waiting_amount)
 async def receive_amount(message: Message, state: FSMContext):
-    if not message.text.strip().isdigit():
-        await message.answer("Please send a valid positive number.")
+    raw_amount = (message.text or "").strip()
+    if not raw_amount.isdigit() or int(raw_amount) <= 0:
+        await message.answer("Please send a valid positive number greater than 0.")
         return
 
-    amount = int(message.text.strip())
+    amount = int(raw_amount)
     data = await state.get_data()
-    gid = data["gid"]
-    action = data["action"]
-    participant_id = data["participant_id"]
+    gid = data.get("gid")
+    action = data.get("action")
+    participant_id = data.get("participant_id")
 
-    delta = amount if action == "add" else -amount
-    log_line = f"{'➕' if action == 'add' else '➖'} {amount} vote(s) {'added' if action == 'add' else 'removed'} by admin"
+    gw = await get_giveaway(gid) if gid else None
+    if not gw or gw.get("creator_id") != message.from_user.id:
+        await state.clear()
+        await message.answer("⛔ You don't have permission to manage this giveaway.")
+        return
+    if gw.get("status") != "active":
+        await state.clear()
+        await message.answer("⛔ This giveaway has already ended. Votes can no longer be changed.")
+        return
+    if action not in ("add", "remove") or not participant_id:
+        await state.clear()
+        await message.answer("❌ This vote-adjustment session is invalid. Please start again from Manage.")
+        return
 
-    gw = await get_giveaway(gid)
+    current = await get_participant(gid, participant_id)
+    if not current:
+        await state.clear()
+        await message.answer("❌ Participant no longer exists in this giveaway.")
+        return
+
+    actual_amount = amount
+    if action == "remove":
+        actual_amount = min(amount, max(int(current.get("votes", 0)), 0))
+        if actual_amount == 0:
+            await state.clear()
+            await message.answer("ℹ️ This participant already has 0 votes.")
+            return
+
+    delta = actual_amount if action == "add" else -actual_amount
+    log_line = (
+        f"{'➕' if action == 'add' else '➖'} {actual_amount} vote(s) "
+        f"{'added' if action == 'add' else 'removed'} by admin"
+    )
+
     participant = await update_votes(gid, participant_id, delta, log_line)
+    if not participant:
+        await state.clear()
+        await message.answer("❌ Participant no longer exists in this giveaway.")
+        return
+
     await refresh_profile_message(gw, participant)
 
     await log_event(
         "🔧 <b>Manual Vote Adjustment</b>\n"
-        f"Giveaway: {gw['channel_title']}\n"
-        f"Admin: {message.from_user.first_name} [<code>{message.from_user.id}</code>]\n"
-        f"Participant: {participant['first_name']} [<code>{participant['user_id']}</code>]\n"
-        f"{'➕ Added' if action == 'add' else '➖ Removed'}: {amount} vote(s)\n"
+        f"Giveaway: {h(gw['channel_title'])}\n"
+        f"Admin: {h(message.from_user.first_name)} [<code>{message.from_user.id}</code>]\n"
+        f"Participant: {h(participant['first_name'])} [<code>{participant['user_id']}</code>]\n"
+        f"{'➕ Added' if action == 'add' else '➖ Removed'}: {actual_amount} vote(s)\n"
         f"New total: <b>{participant['votes']}</b>"
     )
 
-    await message.answer(f"✅ Done. {participant['first_name']} now has <b>{participant['votes']}</b> votes.")
+    note = ""
+    if action == "remove" and actual_amount < amount:
+        note = f" (requested {amount}; stopped at zero)"
+    await message.answer(
+        f"✅ Done. {h(participant['first_name'])} now has <b>{participant['votes']}</b> votes.{note}"
+    )
     await state.clear()
 
 
@@ -1101,13 +1211,13 @@ async def build_scoreboard_text(gid: str, channel_title, gw):
 
     lines = ["🏆 <b>Top 10 Scoreboard</b>"]
     if channel_title:
-        lines.append(f"📢 {channel_title}")
+        lines.append(f"📢 {h(channel_title)}")
     lines.append("")
 
     medals = ["🥇", "🥈", "🥉"]
     for i, p in enumerate(leaderboard):
         medal = medals[i] if i < 3 else f"{i + 1}."
-        uname = f"@{p['username']}" if p.get("username") else p["first_name"]
+        uname = f"@{h(p['username'])}" if p.get("username") else h(p["first_name"])
         link = build_message_link(gw["channel_id"], gw.get("channel_username"), p["profile_message_id"])
         lines.append(f'{medal} <a href="{link}">{uname}</a> (<code>{p["user_id"]}</code>) — <b>{p["votes"]}</b> votes')
 
@@ -1253,10 +1363,15 @@ async def id_cmd(message: Message):
 # ============================================================
 
 async def main():
-    # Enforces one vote per (giveaway, voter, participant) at the database level,
-    # so a double-tap or a scripted replay can never slip through as two votes.
+    # DB-level protections against duplicate participants and concurrent voting.
+    await participants_col.create_index(
+        [("giveaway_id", 1), ("user_id", 1)], unique=True
+    )
     await votes_col.create_index(
         [("giveaway_id", 1), ("voter_id", 1), ("participant_id", 1)], unique=True
+    )
+    await vote_locks_col.create_index(
+        [("giveaway_id", 1), ("voter_id", 1)], unique=True
     )
     await bot.delete_webhook(drop_pending_updates=True)
     log.info("Vote Bot started. Polling...")
