@@ -4,6 +4,8 @@ test_security.py — Verifies vote bot's security fixes:
      (End / Add Vote / Remove Vote / Multi-Vote toggle).
   2. A single voter CANNOT get double-counted even under a race
      (rapid double-tap / replayed request).
+  3. With Multi-Vote OFF, simultaneous votes for DIFFERENT participants
+     still result in only one accepted vote.
 
 Run this in the SAME folder as bot.py, with the same .env present:
 
@@ -140,18 +142,22 @@ async def test_vote_race_protection():
     test_voter_id = -1        # negative IDs can never be real Telegram users
     test_participant_id = -2
 
-    # make sure the unique index exists (main() also creates it on real startup)
+    # make sure the unique indexes exist (main() also creates them on real startup)
     await bot_module.votes_col.create_index(
         [("giveaway_id", 1), ("voter_id", 1), ("participant_id", 1)], unique=True
+    )
+    await bot_module.vote_locks_col.create_index(
+        [("giveaway_id", 1), ("voter_id", 1)], unique=True
     )
 
     # clean slate
     await bot_module.votes_col.delete_many({"giveaway_id": test_gid, "voter_id": test_voter_id})
+    await bot_module.vote_locks_col.delete_many({"giveaway_id": test_gid, "voter_id": test_voter_id})
 
     # fire 20 "simultaneous" vote attempts for the SAME voter + participant
     attempts = 20
     results = await asyncio.gather(
-        *[bot_module.record_vote(test_gid, test_voter_id, test_participant_id) for _ in range(attempts)]
+        *[bot_module.record_vote(test_gid, test_voter_id, test_participant_id, False) for _ in range(attempts)]
     )
     successes = sum(1 for r in results if r)
 
@@ -164,8 +170,28 @@ async def test_vote_race_protection():
         else f"FAIL ⚠️  ({successes} recorded — race condition NOT fixed!)",
     )
 
+    # cleanup first race test
+    await bot_module.votes_col.delete_many({"giveaway_id": test_gid, "voter_id": test_voter_id})
+    await bot_module.vote_locks_col.delete_many({"giveaway_id": test_gid, "voter_id": test_voter_id})
+
+    # Multi-Vote OFF: try 20 DIFFERENT participants simultaneously.
+    participant_ids = [-(100 + i) for i in range(attempts)]
+    results = await asyncio.gather(
+        *[bot_module.record_vote(test_gid, test_voter_id, pid, False) for pid in participant_ids]
+    )
+    successes = sum(1 for r in results if r)
+    print(f"  Different-participant concurrent attempts: {attempts}")
+    print(f"  Successfully recorded: {successes}")
+    print(
+        "  RESULT:",
+        "PASS ✅ (Multi-Vote OFF allowed exactly 1 vote)"
+        if successes == 1
+        else f"FAIL ⚠️  ({successes} recorded — Multi-Vote OFF race still exists!)",
+    )
+
     # cleanup test data
     await bot_module.votes_col.delete_many({"giveaway_id": test_gid, "voter_id": test_voter_id})
+    await bot_module.vote_locks_col.delete_many({"giveaway_id": test_gid, "voter_id": test_voter_id})
 
 
 # ============================================================
