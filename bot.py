@@ -19,6 +19,8 @@ import re
 import time
 from datetime import datetime
 from html import escape
+from collections.abc import Mapping
+from typing import Any
 
 from bson import ObjectId
 from dotenv import load_dotenv
@@ -31,7 +33,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject, CommandStart, Filter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.base import BaseStorage, StorageKey, StateType
 from aiogram.types import CallbackQuery, ChatMemberUpdated, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -66,6 +68,124 @@ participants_col = db["participants"]
 votes_col = db["votes"]
 vote_locks_col = db["vote_locks"]
 users_col = db["users"]
+fsm_col = db["fsm_states"]
+
+
+class MongoFSMStorage(BaseStorage):
+    """Persistent aiogram FSM storage backed by this bot's MongoDB database.
+
+    State and FSM data survive process crashes/restarts.  The Mongo client is
+    shared with the rest of the bot, so ``close`` intentionally does not close
+    it; the application owns that client.
+    """
+
+    def __init__(self, collection):
+        self.collection = collection
+
+    @staticmethod
+    def _key_filter(key: StorageKey) -> dict[str, Any]:
+        return {
+            "bot_id": key.bot_id,
+            "chat_id": key.chat_id,
+            "user_id": key.user_id,
+            "thread_id": key.thread_id,
+            "business_connection_id": key.business_connection_id,
+            "destiny": key.destiny,
+        }
+
+    async def set_state(self, key: StorageKey, state: StateType = None) -> None:
+        state_value = state.state if isinstance(state, State) else state
+        key_filter = self._key_filter(key)
+
+        if state_value is None:
+            await self.collection.update_one(
+                key_filter,
+                {"$unset": {"state": ""}, "$set": {"updated_at": datetime.utcnow()}},
+                upsert=False,
+            )
+            doc = await self.collection.find_one(key_filter, {"state": 1, "data": 1})
+            if doc and not doc.get("state") and not doc.get("data"):
+                await self.collection.delete_one(key_filter)
+            return
+
+        await self.collection.update_one(
+            key_filter,
+            {
+                "$set": {
+                    "state": state_value,
+                    "updated_at": datetime.utcnow(),
+                },
+                "$setOnInsert": {"created_at": datetime.utcnow(), "data": {}},
+            },
+            upsert=True,
+        )
+
+    async def get_state(self, key: StorageKey) -> str | None:
+        doc = await self.collection.find_one(self._key_filter(key), {"state": 1})
+        return doc.get("state") if doc else None
+
+    async def set_data(self, key: StorageKey, data: Mapping[str, Any]) -> None:
+        if not isinstance(data, Mapping):
+            raise TypeError(f"Data must be dict-like, got {type(data).__name__}")
+
+        new_data = dict(data)
+        key_filter = self._key_filter(key)
+        if not new_data:
+            await self.collection.update_one(
+                key_filter,
+                {"$set": {"data": {}, "updated_at": datetime.utcnow()}},
+                upsert=False,
+            )
+            doc = await self.collection.find_one(key_filter, {"state": 1, "data": 1})
+            if doc and not doc.get("state") and not doc.get("data"):
+                await self.collection.delete_one(key_filter)
+            return
+
+        await self.collection.update_one(
+            key_filter,
+            {
+                "$set": {
+                    "data": new_data,
+                    "updated_at": datetime.utcnow(),
+                },
+                "$setOnInsert": {"created_at": datetime.utcnow()},
+            },
+            upsert=True,
+        )
+
+    async def get_data(self, key: StorageKey) -> dict[str, Any]:
+        doc = await self.collection.find_one(self._key_filter(key), {"data": 1})
+        if not doc or not isinstance(doc.get("data"), dict):
+            return {}
+        return dict(doc["data"])
+
+    async def update_data(self, key: StorageKey, data: Mapping[str, Any]) -> dict[str, Any]:
+        """Atomically merge simple FSM values into MongoDB."""
+        if not isinstance(data, Mapping):
+            raise TypeError(f"Data must be dict-like, got {type(data).__name__}")
+        if not data:
+            return await self.get_data(key)
+
+        key_filter = self._key_filter(key)
+        set_fields = {f"data.{field}": value for field, value in dict(data).items()}
+        set_fields["updated_at"] = datetime.utcnow()
+        await self.collection.update_one(
+            key_filter,
+            {
+                "$set": set_fields,
+                "$setOnInsert": {"created_at": datetime.utcnow()},
+            },
+            upsert=True,
+        )
+        return await self.get_data(key)
+
+    async def get_value(self, storage_key: StorageKey, dict_key: str, default: Any = None) -> Any:
+        data = await self.get_data(storage_key)
+        return data.get(dict_key, default)
+
+    async def close(self) -> None:
+        # Shared mongo_client is owned by the application, not this storage.
+        return None
 
 
 # ---------- USERS (for broadcast / stats) ----------
@@ -471,7 +591,8 @@ def build_message_link(channel_id: int, channel_username, message_id: int) -> st
 # ============================================================
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher(storage=MemoryStorage())
+fsm_storage = MongoFSMStorage(fsm_col)
+dp = Dispatcher(storage=fsm_storage)
 
 START_TIME = time.time()
 
@@ -1373,7 +1494,21 @@ async def main():
     await vote_locks_col.create_index(
         [("giveaway_id", 1), ("voter_id", 1)], unique=True
     )
-    await bot.delete_webhook(drop_pending_updates=True)
+    await fsm_col.create_index(
+        [
+            ("bot_id", 1),
+            ("chat_id", 1),
+            ("user_id", 1),
+            ("thread_id", 1),
+            ("business_connection_id", 1),
+            ("destiny", 1),
+        ],
+        unique=True,
+        name="fsm_context_unique",
+    )
+    # Keep updates received while the bot was briefly offline so a pending FSM
+    # reply (participant ID, vote amount, etc.) is processed after restart.
+    await bot.delete_webhook(drop_pending_updates=False)
     log.info("Vote Bot started. Polling...")
     await dp.start_polling(bot)
 
